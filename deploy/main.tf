@@ -8,14 +8,22 @@ variable "access_key" {}
 variable "secret_key" {}
 variable "region" {}
 
-# IAM role for the lambdas to execute
+data "aws_caller_identity" "current" {}
+
 resource "aws_iam_role" "terraform_tester_iam" {
   name = "terraform_tester_iam"
   assume_role_policy = "${file("lambda-role.json")}"
 }
 
-# Lambdas definition
-resource "aws_lambda_function" "terraform_tester_lambdas" {
+resource "aws_lambda_permission" "lambdaPermission" {
+  statement_id = "lambdaPermission"
+  action = "lambda:InvokeFunction"
+  function_name = "${aws_lambda_function.lambda.arn}"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "arn:aws:execute-api:${var.region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.api.id}/*"
+}
+
+resource "aws_lambda_function" "lambda" {
   filename = "../target/terraform_tester.jar"
   function_name = "terraform_tester"
   role = "${aws_iam_role.terraform_tester_iam.arn}"
@@ -24,75 +32,63 @@ resource "aws_lambda_function" "terraform_tester_lambdas" {
   source_code_hash = "${base64sha256(file("../target/terraform_tester.jar"))}"
 }
 
-# API Gateway definition
-resource "aws_api_gateway_rest_api" "terraform_tester_api" {
-  name = "terraform_tester_api"
-  description = "API for the zodiac-emails project"
-  depends_on = ["aws_lambda_function.terraform_tester_lambdas"]
+resource "aws_api_gateway_rest_api" "api" {
+  name = "zodiacEmailsAPI"
+  description = "zodiac-emails API"
+  depends_on = ["aws_lambda_function.lambda"]
 }
 
-# API Gateway resource (aka endpoint) definition
-resource "aws_api_gateway_resource" "terraform_tester_api_resource" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  parent_id = "${aws_api_gateway_rest_api.terraform_tester_api.root_resource_id}"
+resource "aws_api_gateway_resource" "resource" {
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  parent_id = "${aws_api_gateway_rest_api.api.root_resource_id}"
   path_part = "emails"
 }
 
-# API Gateway resource's method definition
-resource "aws_api_gateway_method" "terraform_tester_get_method" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  resource_id = "${aws_api_gateway_resource.terraform_tester_api_resource.id}"
-  http_method = "GET"
+resource "aws_api_gateway_resource" "requestId" {
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  parent_id = "${aws_api_gateway_resource.resource.id}"
+  path_part = "{requestId}"
+}
+
+resource "aws_api_gateway_method" "get" {
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  resource_id = "${aws_api_gateway_resource.requestId.id}"
+  http_method = "POST"
   authorization = "NONE"
-
-  request_parameters = {
-    "method.request.path.requestId" = true
-  }
-}
-
-# Integrate the lambdas with the API endpoint
-resource "aws_api_gateway_integration" "terraform_tester_integration" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  resource_id = "${aws_api_gateway_resource.terraform_tester_api_resource.id}"
-  http_method = "${aws_api_gateway_method.terraform_tester_get_method.http_method}"
-  type = "AWS"
-  integration_http_method = "${aws_api_gateway_method.terraform_tester_get_method.http_method}"
-  uri = "arn:aws:apigateway:${var.region}:lambda:path/2015-03-31/functions/${aws_lambda_function.terraform_tester_lambdas.arn}/invocations"
-}
-
-resource "aws_api_gateway_model" "terraform_tester_response_model" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  name = "requestId"
-  description = "The request ID"
-  content_type = "application/json"
-  schema = <<EOF
-{
-  "type": "object"
-}
-EOF
+  depends_on = ["aws_lambda_permission.lambdaPermission"]
 }
 
 resource "aws_api_gateway_method_response" "200" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  resource_id = "${aws_api_gateway_resource.terraform_tester_api_resource.id}"
-  http_method = "${aws_api_gateway_method.terraform_tester_get_method.http_method}"
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  resource_id = "${aws_api_gateway_resource.requestId.id}"
+  http_method = "${aws_api_gateway_method.get.http_method}"
   status_code = "200"
+}
 
-  response_models = {
-    "application/json" = "${aws_api_gateway_model.terraform_tester_response_model.name}"
+resource "aws_api_gateway_integration" "integration" {
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  resource_id = "${aws_api_gateway_resource.requestId.id}"
+  http_method = "${aws_api_gateway_method.get.http_method}"
+  type = "AWS"
+  integration_http_method = "${aws_api_gateway_method.get.http_method}"
+  uri = "arn:aws:apigateway:${var.region}:lambda:path/2015-03-31/functions/${aws_lambda_function.lambda.arn}/invocations"
+  request_templates = {
+    "application/json" = "${file("get_request.json")}"
   }
 }
 
-resource "aws_api_gateway_integration_response" "terraform_tester_integration_response" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
-  resource_id = "${aws_api_gateway_resource.terraform_tester_api_resource.id}"
-  http_method = "${aws_api_gateway_method.terraform_tester_get_method.http_method}"
+resource "aws_api_gateway_integration_response" "response" {
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
+  resource_id = "${aws_api_gateway_resource.requestId.id}"
+  http_method = "${aws_api_gateway_method.get.http_method}"
   status_code = "${aws_api_gateway_method_response.200.status_code}"
-  depends_on = ["aws_api_gateway_integration.terraform_tester_integration"]
+  response_templates = {
+    "application/json" = "${file("get_response.json")}"
+  }
 }
 
 resource "aws_api_gateway_deployment" "production" {
-  rest_api_id = "${aws_api_gateway_rest_api.terraform_tester_api.id}"
+  rest_api_id = "${aws_api_gateway_rest_api.api.id}"
   stage_name = "api"
-  depends_on = ["aws_api_gateway_integration.terraform_tester_integration"]
+  depends_on = ["aws_api_gateway_integration.integration"]
 }
